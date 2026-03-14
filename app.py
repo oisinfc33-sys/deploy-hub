@@ -24,18 +24,23 @@ def get_db():
     return psycopg.connect(DATABASE_URL)
 
 def init_db():
-    with get_db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS searches (
-                    id SERIAL PRIMARY KEY,
-                    city VARCHAR(100),
-                    temperature FLOAT,
-                    description VARCHAR(200),
-                    searched_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-        conn.commit()
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS searches (
+                        id SERIAL PRIMARY KEY,
+                        city VARCHAR(100),
+                        temperature FLOAT,
+                        description VARCHAR(200),
+                        country_code VARCHAR(10),
+                        searched_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+            conn.commit()
+        logger.info("Database initialised successfully")
+    except Exception as e:
+        logger.warning(f"Database init failed: {str(e)}")
 
 @app.route("/")
 def index():
@@ -50,22 +55,43 @@ def weather():
     start = time.time()
     logger.info(f"request_id={request_id} path=/weather city={city}")
     try:
-        url = f"http://api.openweathermap.org/data/2.5/weather?q={city}&appid={WEATHER_API_KEY}&units=metric"
-        response = requests.get(url, timeout=5)
+        response = requests.get(
+            "http://api.openweathermap.org/data/2.5/weather",
+            params={"q": city, "appid": WEATHER_API_KEY, "units": "metric"},
+            timeout=5
+        )
         response.raise_for_status()
         data = response.json()
         temp = data["main"]["temp"]
         description = data["weather"][0]["description"]
-        with get_db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO searches (city, temperature, description) VALUES (%s, %s, %s)",
-                    (city, temp, description)
-                )
-            conn.commit()
+        country_code = data["sys"]["country"]
+        feels_like = data["main"]["feels_like"]
+        humidity = data["main"]["humidity"]
+        wind_speed = data["wind"]["speed"] * 3.6
+        visibility = data.get("visibility")
+        try:
+            with get_db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "INSERT INTO searches (city, temperature, description, country_code) VALUES (%s, %s, %s, %s)",
+                        (city, temp, description, country_code)
+                    )
+                conn.commit()
+        except Exception as db_err:
+            logger.warning(f"request_id={request_id} db_write_failed={str(db_err)}")
         duration = round(time.time() - start, 3)
         logger.info(f"request_id={request_id} duration={duration}s status=success")
-        return jsonify({"city": city, "temperature": temp, "description": description, "request_id": request_id})
+        return jsonify({
+            "city": data["name"],
+            "temperature": temp,
+            "description": description,
+            "feels_like": feels_like,
+            "humidity": humidity,
+            "wind_speed": wind_speed,
+            "visibility": visibility,
+            "country_code": country_code,
+            "request_id": request_id
+        })
     except requests.exceptions.RequestException as e:
         logger.error(f"request_id={request_id} error={str(e)}")
         return jsonify({"error": "Weather service unavailable", "request_id": request_id}), 503
@@ -77,13 +103,16 @@ def history():
     try:
         with get_db() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT city, temperature, description, searched_at FROM searches ORDER BY searched_at DESC LIMIT 10")
+                cur.execute("""
+                    SELECT city, temperature, description, country_code, searched_at
+                    FROM searches ORDER BY searched_at DESC LIMIT 10
+                """)
                 rows = cur.fetchall()
-        results = [{"city": r[0], "temperature": r[1], "description": r[2], "searched_at": str(r[3])} for r in rows]
+        results = [{"city": r[0], "temperature": r[1], "description": r[2], "country_code": r[3], "searched_at": str(r[4])} for r in rows]
         return jsonify(results)
     except Exception as e:
         logger.error(f"request_id={request_id} error={str(e)}")
-        return jsonify({"error": "Database unavailable"}), 503
+        return jsonify([])
 
 @app.route("/health")
 def health():
@@ -102,7 +131,8 @@ def status():
     weather_ok = False
     try:
         r = requests.get(
-            f"http://api.openweathermap.org/data/2.5/weather?q=Dublin&appid={WEATHER_API_KEY}&units=metric",
+            "http://api.openweathermap.org/data/2.5/weather",
+            params={"q": "Dublin", "appid": WEATHER_API_KEY, "units": "metric"},
             timeout=5
         )
         weather_ok = r.status_code == 200
